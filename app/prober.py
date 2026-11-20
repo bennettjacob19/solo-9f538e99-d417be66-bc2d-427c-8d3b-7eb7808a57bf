@@ -5,6 +5,12 @@
   并发探测、迟到回包不会串入其他结论；
 - 探测 socket 设置 DF 位，禁止 IP 分片；发送失败（如 EMSGSIZE）与超时
   同等对待；
+- 超时与 RTT 以**逐包内核收包时刻**（SO_TIMESTAMPNS）为准：
+  回包在时限内到达内核即算成功，哪怕事件循环稍后才读到它；
+  内核收包时刻超过时限的回包不予采信，既不能推进二分，也不会
+  留作下一次探测的回包；
+- 收到匹配回包却无法确认其内核收包时刻时，无法判定是否超时，
+  本次探测终止并报告 undetermined，已确认的下界保留；
 - 大包超时或发送失败时，先用小包（small_size）复核链路：
   小包通 → 链路正常，确为尺寸受限，继续二分；
   小包也不通 → 链路不确定，立即终止，绝不把该失败记为尺寸上限；
@@ -15,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import time
 import uuid
 from datetime import datetime, timezone
@@ -22,9 +29,12 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from . import netutil
 from .echo_server import EchoState
-from .netutil import set_dont_fragment
 from .packets import HEADER_SIZE, MAX_UDP_PAYLOAD, build_packet, parse_packet
+
+_RECV_BUFSIZE = 65536  # 大于最大 UDP 负载 65507，保证整包读出
+_ANC_BUFSIZE = 512  # 足够容纳 SO_TIMESTAMPNS 控制消息
 
 # ---------------------------------------------------------------------------
 # API 模型
@@ -52,8 +62,13 @@ class AttemptOut(BaseModel):
     seq: int
     size: int
     purpose: Literal["probe", "link-verify"]
-    outcome: Literal["ok", "timeout", "send_error"]
-    rtt_ms: Optional[float] = None
+    outcome: Literal["ok", "timeout", "send_error", "undetermined"]
+    rtt_ms: Optional[float] = Field(
+        None, description="往返时延：匹配回包的内核收包时刻 − 发送时刻（毫秒）"
+    )
+    kernel_recv_at: Optional[float] = Field(
+        None, description="匹配回包的内核收包时刻（Unix 秒）；未收到匹配回包时为 null"
+    )
     detail: Optional[str] = None
 
 
@@ -68,10 +83,14 @@ class ProbeResult(BaseModel):
     min_size: int
     max_size: int
     attempts: list[AttemptOut]
-    stray_replies: int = Field(0, description="被丢弃的迟到/不对应回包数")
+    stray_replies: int = Field(0, description="被丢弃的不对应回包数（编号/序号/长度不符）")
+    late_replies: int = Field(0, description="内核收包时刻已超过时限的匹配回包数（不予采信）")
     config_epoch_start: int
     config_epoch_end: int
     df_enabled: bool = Field(..., description="探测 socket 是否成功设置 DF（禁止 IP 分片）")
+    kernel_ts_enabled: bool = Field(
+        ..., description="探测 socket 是否成功启用逐包内核收包时刻（SO_TIMESTAMPNS）"
+    )
     target: str
     started_at: datetime
     finished_at: datetime
@@ -83,22 +102,15 @@ class ProbeResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class _Inbound(asyncio.DatagramProtocol):
-    """把收到的数据报/发送错误塞进队列，由探测协程自行匹配。
+class _RecvTimeUndetermined(Exception):
+    """收到匹配回包，但无法确认其内核收包时刻（无法判定是否超时）。
 
-    注意：asyncio 的 DatagramTransport.sendto 不会把 OSError 抛给调用方，
-    发送失败（如 EMSGSIZE）经 error_received 回调上报。
+    携带本次探测记录，由 probe() 捕获后终止二分并报告 undetermined。
     """
 
-    def __init__(self) -> None:
-        self.queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
-
-    def datagram_received(self, data: bytes, addr) -> None:  # noqa: ANN001
-        self.queue.put_nowait(("data", data))
-
-    def error_received(self, exc: Exception) -> None:
-        # 发送失败（EMSGSIZE 等）或连通型 UDP 的异步 ICMP 错误
-        self.queue.put_nowait(("error", exc))
+    def __init__(self, attempt: AttemptOut) -> None:
+        super().__init__(attempt.detail or "")
+        self.attempt = attempt
 
 
 class Prober:
@@ -120,56 +132,141 @@ class Prober:
         epoch_start = self._state.epoch
         attempts: list[AttemptOut] = []
         stray = 0
+        late = 0
         seq = 0
+
+        loop = asyncio.get_running_loop()
+        # 异步解析目标地址，不阻塞事件循环（等待期间其他探测照常进行）；
+        # 解析失败抛 OSError，由上层转为 400。
+        infos = await loop.getaddrinfo(
+            host, port, family=socket.AF_INET, type=socket.SOCK_DGRAM
+        )
+        sockaddr = infos[0][4]
 
         # 每次探测运行独立 socket（独立临时端口），并 connect 到回显端：
         # 其他运行的回包、无关数据报在内核层就被过滤，不会到达本 socket。
-        loop = asyncio.get_running_loop()
-        transport, proto = await loop.create_datagram_endpoint(
-            _Inbound, remote_addr=(host, port)
-        )
-        sock = transport.get_extra_info("socket")
-        df_ok = set_dont_fragment(sock) if sock is not None else False
-        queue: asyncio.Queue[tuple[str, object]] = proto.queue
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+
+        def on_readable() -> None:
+            """把内核已收到的数据报全部读进队列，每个包附带内核收包时刻。"""
+            while True:
+                try:
+                    data, ancdata, _flags, _addr = sock.recvmsg(_RECV_BUFSIZE, _ANC_BUFSIZE)
+                except (BlockingIOError, InterruptedError):
+                    return
+                except OSError as exc:
+                    # 连通型 UDP 的异步 ICMP 错误（如对端端口不可达）
+                    queue.put_nowait(("error", exc))
+                    return
+                queue.put_nowait(("data", (data, netutil.extract_kernel_timestamp(ancdata))))
+
+        sock_fd = sock.fileno()
+        try:
+            sock.connect(sockaddr)
+            df_ok = netutil.set_dont_fragment(sock)
+            ts_ok = netutil.enable_kernel_timestamps(sock)
+            loop.add_reader(sock_fd, on_readable)
+        except Exception:
+            sock.close()
+            raise
+
+        timeout_s = req.timeout_ms / 1000.0
 
         async def attempt(size: int, purpose: Literal["probe", "link-verify"]) -> AttemptOut:
-            nonlocal seq, stray
+            nonlocal seq, stray, late
             seq += 1
             my_seq = seq
             payload = build_packet(probe_id, my_seq, size)
-            t_send = time.monotonic()
-            transport.sendto(payload)
-            deadline = t_send + req.timeout_ms / 1000.0
+            try:
+                await loop.sock_sendall(sock, payload)
+            except OSError as exc:
+                # 发送失败（如 EMSGSIZE：DF 下超过路径 MTU）
+                return AttemptOut(
+                    seq=my_seq, size=size, purpose=purpose,
+                    outcome="send_error",
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+            # 内核收包时刻为 CLOCK_REALTIME，与 time.time() 同时基；
+            # 等待循环另用单调时钟，二者各司其职。
+            t_send_wall = time.time()
+            t_send_mono = time.monotonic()
+            deadline_wall = t_send_wall + timeout_s
+            deadline_mono = t_send_mono + timeout_s
+
+            def judge(data: bytes, recv_at: Optional[float]) -> Optional[AttemptOut]:
+                """判定一个收到的数据报；不对应返回 None（继续等）。"""
+                nonlocal stray, late
+                pkt = parse_packet(data)
+                if (
+                    pkt is None
+                    or pkt.session_id != probe_id
+                    or pkt.seq != my_seq
+                    or pkt.size != size
+                ):
+                    # 不对应回包：丢弃不采信
+                    stray += 1
+                    return None
+                if recv_at is None:
+                    # 收包时刻无法确认 → 无法判定是否超时，整个探测终止
+                    raise _RecvTimeUndetermined(
+                        AttemptOut(
+                            seq=my_seq, size=size, purpose=purpose,
+                            outcome="undetermined",
+                            detail="收到匹配回包，但无法确认其内核收包时刻",
+                        )
+                    )
+                if recv_at <= deadline_wall:
+                    return AttemptOut(
+                        seq=my_seq, size=size, purpose=purpose,
+                        outcome="ok",
+                        rtt_ms=round((recv_at - t_send_wall) * 1000.0, 3),
+                        kernel_recv_at=recv_at,
+                    )
+                # 内核收包时刻已超过时限：迟到的回包不采信、不留存
+                late += 1
+                return AttemptOut(
+                    seq=my_seq, size=size, purpose=purpose,
+                    outcome="timeout",
+                    kernel_recv_at=recv_at,
+                    detail=f"匹配回包迟到：内核收包时刻已超过 {req.timeout_ms}ms 时限，不予采信",
+                )
+
+            def send_error_outcome(exc: Exception) -> AttemptOut:
+                return AttemptOut(
+                    seq=my_seq, size=size, purpose=purpose,
+                    outcome="send_error",
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+
+            # 阶段一：在单调时钟时限内等待接收队列
             while True:
-                remaining = deadline - time.monotonic()
+                remaining = deadline_mono - time.monotonic()
                 if remaining <= 0:
-                    return AttemptOut(seq=my_seq, size=size, purpose=purpose, outcome="timeout")
+                    break
                 try:
                     kind, obj = await asyncio.wait_for(queue.get(), remaining)
                 except asyncio.TimeoutError:
+                    break
+                if kind == "error":
+                    return send_error_outcome(obj)  # type: ignore[arg-type]
+                out = judge(*obj)  # type: ignore[misc]
+                if out is not None:
+                    return out
+            # 阶段二：事件循环可能刚恢复——把内核缓冲读空再判一次，
+            # 时限内到达（以内核收包时刻为准）的匹配回包仍然采信
+            on_readable()
+            while True:
+                try:
+                    kind, obj = queue.get_nowait()
+                except asyncio.QueueEmpty:
                     return AttemptOut(seq=my_seq, size=size, purpose=purpose, outcome="timeout")
                 if kind == "error":
-                    # 发送失败（如 EMSGSIZE：DF 下超过路径 MTU）
-                    exc = obj
-                    return AttemptOut(
-                        seq=my_seq, size=size, purpose=purpose,
-                        outcome="send_error",
-                        detail=f"{type(exc).__name__}: {exc}",
-                    )
-                pkt = parse_packet(obj)  # type: ignore[arg-type]
-                if (
-                    pkt is not None
-                    and pkt.session_id == probe_id
-                    and pkt.seq == my_seq
-                    and pkt.size == size
-                ):
-                    rtt = (time.monotonic() - t_send) * 1000.0
-                    return AttemptOut(
-                        seq=my_seq, size=size, purpose=purpose,
-                        outcome="ok", rtt_ms=round(rtt, 3),
-                    )
-                # 迟到/不对应回包：丢弃不采信，继续等到超时为止
-                stray += 1
+                    return send_error_outcome(obj)  # type: ignore[arg-type]
+                out = judge(*obj)  # type: ignore[misc]
+                if out is not None:
+                    return out
 
         def epoch_broken() -> bool:
             return self._state.epoch != epoch_start
@@ -186,38 +283,44 @@ class Prober:
         lo, hi = req.min_size, req.max_size
 
         try:
-            while lo <= hi:
-                if epoch_broken():
-                    status, reason = invalidated_result()
-                    best = None
+            try:
+                while lo <= hi:
+                    if epoch_broken():
+                        status, reason = invalidated_result()
+                        best = None
+                        break
+                    mid = (lo + hi) // 2
+                    att = await attempt(mid, "probe")
+                    attempts.append(att)
+                    if att.outcome == "ok":
+                        best = mid
+                        lo = mid + 1
+                        continue
+                    # 大包失败（超时或发送失败）→ 小包复核链路
+                    verify = await attempt(req.small_size, "link-verify")
+                    attempts.append(verify)
+                    if verify.outcome == "ok":
+                        hi = mid - 1  # 链路正常，确为尺寸受限
+                        continue
+                    if epoch_broken():
+                        status, reason = invalidated_result()
+                        best = None
+                    else:
+                        status = "undetermined"
+                        reason = (
+                            f"{mid} 字节探测{('超时' if att.outcome == 'timeout' else '发送失败')}后，"
+                            f"{req.small_size} 字节小包复核亦失败（{verify.outcome}），"
+                            "链路状态不确定，不能将该失败记为尺寸上限"
+                        )
+                        # 保留此前已确认的下界，但绝不把失败尺寸当作上限
                     break
-                mid = (lo + hi) // 2
-                att = await attempt(mid, "probe")
-                attempts.append(att)
-                if att.outcome == "ok":
-                    best = mid
-                    lo = mid + 1
-                    continue
-                # 大包失败（超时或发送失败）→ 小包复核链路
-                verify = await attempt(req.small_size, "link-verify")
-                attempts.append(verify)
-                if verify.outcome == "ok":
-                    hi = mid - 1  # 链路正常，确为尺寸受限
-                    continue
-                if epoch_broken():
-                    status, reason = invalidated_result()
-                    best = None
-                else:
-                    status = "undetermined"
-                    reason = (
-                        f"{mid} 字节探测{('超时' if att.outcome == 'timeout' else '发送失败')}后，"
-                        f"{req.small_size} 字节小包复核亦失败（{verify.outcome}），"
-                        "链路状态不确定，不能将该失败记为尺寸上限"
-                    )
-                    # 保留此前已确认的下界，但绝不把失败尺寸当作上限
-                break
-            else:
-                pass
+            except _RecvTimeUndetermined as exc:
+                attempts.append(exc.attempt)
+                status = "undetermined"
+                reason = (
+                    "收到匹配回包，但其内核收包时刻无法确认，无法判定是否超过时限；"
+                    "本次探测终止，此前已确认的下界仍然有效"
+                )
 
             if status == "ok":
                 if epoch_broken():
@@ -230,7 +333,8 @@ class Prober:
                         f"{req.min_size} 字节未获确认，可确认上限低于探测范围"
                     )
         finally:
-            transport.close()
+            loop.remove_reader(sock_fd)
+            sock.close()
 
         finished_at = datetime.now(timezone.utc)
         return ProbeResult(
@@ -243,9 +347,11 @@ class Prober:
             max_size=req.max_size,
             attempts=attempts,
             stray_replies=stray,
+            late_replies=late,
             config_epoch_start=epoch_start,
             config_epoch_end=self._state.epoch,
             df_enabled=df_ok,
+            kernel_ts_enabled=ts_ok,
             target=target,
             started_at=started_at,
             finished_at=finished_at,

@@ -45,14 +45,23 @@ pytest tests/ -v
    |---|---|---|
    | `ok` | 已确认最大可用负载 | 确认值（等于 `max_size` 时 `reached_range_max=true`，实际上限可能更高） |
    | `below_range` | 链路正常，但范围下限都确认不了 | `null` |
-   | `undetermined` | 大包失败后小包复核也失败，**链路不确定** | 此前已确认的下界（无则 `null`），**绝不把故障当作尺寸上限** |
+   | `undetermined` | 大包失败后小包复核也失败，**链路不确定**；或匹配回包的收包时刻无法确认 | 此前已确认的下界（无则 `null`），**绝不把故障当作尺寸上限** |
    | `invalidated` | 探测期间回显端配置被修改，**本次结论作废** | `null` |
 
-   `attempts[]` 列出每次探测（`probe`）与小包复核（`link-verify`）的尺寸、结果与 RTT。
-4. 历史结论：`GET /probes`、`GET /probe/{probe_id}`（内存保留最近 200 条）。
+   `attempts[]` 列出每次探测（`probe`）与小包复核（`link-verify`）的尺寸、结果、
+   内核收包时刻（`kernel_recv_at`）与 RTT（`rtt_ms`，按内核收包时刻计算）。
+4. 历史结论：`GET /probes`、`GET /probe/{probe_id}`（内存保留最近 200 条，
+   与当次答复是同一份逐次结果与最大确认长度）。
 
 ## 判定规则与需求对应
 
+- **逐包内核收包时刻**：探测 socket 启用 `SO_TIMESTAMPNS`，接收层用 `recvmsg`
+  取得每个回包的**内核收包时刻**（`CLOCK_REALTIME`）。超时判定与 RTT 都以此为
+  准：回包在时限内到达内核即算成功——哪怕事件循环稍后（如卡顿恢复后）才读到
+  它；内核收包时刻超过时限的回包**不予采信**，既不能推进二分，也不会留作下
+  一次探测的回包（计入 `late_replies`）。结果中 `kernel_ts_enabled` 如实上报。
+- **收包时刻无法确认**：若平台不支持内核打戳或时刻解析失败，收到匹配回包时
+  无法判定是否超时，本次探测立即终止并报告 `undetermined`，**已确认的下界保留**。
 - **禁止 IP 分片**：探测与回显 socket 均设置 `IP_MTU_DISCOVER/IP_PMTUDISC_DO`（DF=1），
   结果中 `df_enabled` 如实上报；超过路径 MTU 时发送直接失败（EMSGSIZE），按发送失败处理。
 - **报文带本次探测编号**：每次运行生成 UUID，连同序号写入 28 字节报文头
@@ -62,7 +71,8 @@ pytest tests/ -v
 - **配置改变结论作废**：回显端配置带单调递增的 `epoch`，探测开始/每步/结束比对，
   不一致即 `invalidated`。
 - **并发与迟到回包隔离**：每次探测运行使用独立临时端口 socket 并 connect 到回显端，
-  其他运行的回包在内核层就被过滤；迟到的本次回包按序号拒收并计入 `stray_replies`。
+  其他运行的回包在内核层就被过滤；等待回包期间其他探测照常进行；
+  不对应的回包按序号拒收并计入 `stray_replies`。
 - **配置失败保留原状态**：配置先经 Pydantic 校验，通过才原子替换并递增 epoch。
 
 ## 环境变量
@@ -79,9 +89,13 @@ pytest tests/ -v
 app/
   main.py        # FastAPI 路由与生命周期
   echo_server.py # 本地回显端（阈值丢弃/断联，epoch）
-  prober.py      # 二分探测引擎（DF、探测编号、小包复核、作废判定）
+  prober.py      # 二分探测引擎（内核收包时刻、DF、探测编号、小包复核、作废判定）
   packets.py     # 探测报文编解码
-  netutil.py     # DF 位设置
+  netutil.py     # DF 位设置、SO_TIMESTAMPNS 内核收包时刻
 tests/test_api.py
 Dockerfile / docker-compose.yml
 ```
+
+> 注：逐包内核收包时刻依赖 Linux 的 `SO_TIMESTAMPNS` 与 `recvmsg` 控制消息
+> （Docker 镜像 python:3.12-slim 满足）；不支持的平台会如实上报
+> `kernel_ts_enabled=false`，并在收到匹配回包时按 `undetermined` 处理。
